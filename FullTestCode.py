@@ -18,10 +18,10 @@ picam2.start()
 pi = pigpio.pi()
 
 # Define the GPIO pins
-SERVO_PAN_PIN = 18    # Horizontal movement (left/right)
-SERVO_TILT_PIN = 19   # Vertical movement (up/down)
-MOTOR_PIN_1 = 12      # Motor control pin 1
-MOTOR_PIN_2 = 13      # Motor control pin 2 (if using a dual motor setup)
+SERVO_DIRECTION_PIN = 18  # Left/right movement servo
+SERVO_RELEASE_PIN = 19    # Ball release ("afvoer") servo
+MOTOR_PIN_1 = 12          # Motor control pin 1
+MOTOR_PIN_2 = 13          # Motor control pin 2 (for the second motor)
 
 # PWM frequency for motor control
 MOTOR_PWM_FREQ = 1000  # 1 kHz
@@ -32,9 +32,9 @@ if not pi.connected:
     print("Try running 'sudo pigpiod' first.")
     exit()
 
-# Set up servo initial positions (center)
-pi.set_servo_pulsewidth(SERVO_PAN_PIN, 1500)  # Center position
-pi.set_servo_pulsewidth(SERVO_TILT_PIN, 1500) # Center position
+# Set up servo initial positions
+pi.set_servo_pulsewidth(SERVO_DIRECTION_PIN, 1500)  # Center position
+pi.set_servo_pulsewidth(SERVO_RELEASE_PIN, 1000)    # Closed position (holding balls)
 
 # Set up motor pins as output and initialize to off
 pi.set_mode(MOTOR_PIN_1, pigpio.OUTPUT)
@@ -48,14 +48,15 @@ pi.set_PWM_frequency(MOTOR_PIN_2, MOTOR_PWM_FREQ)
 pi.set_PWM_dutycycle(MOTOR_PIN_1, 0)
 pi.set_PWM_dutycycle(MOTOR_PIN_2, 0)
 
-# Current servo positions
-servo_positions = {
-    'pan': 1500,   # Range 500-2500 (0 = center)
-    'tilt': 1500   # Range 500-2500 (0 = center)
-}
+# Current servo position for direction
+direction_position = 1500  # Range 500-2500 (1500 = center)
 
 # Current motor power
 motor_power = 0    # Range 0-100%
+
+# Launch lock to prevent multiple launches at once
+launch_lock = threading.Lock()
+is_launching = False
 
 def generate_frames():
     """Video streaming generator function."""
@@ -66,7 +67,6 @@ def generate_frames():
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
 
-# Create HTML template with servo control arrows and motor power slider
 @app.route('/')
 def index():
     return '''
@@ -116,7 +116,7 @@ def index():
                 gap: 10px;
                 justify-content: center;
             }
-            .arrow-btn {
+            .direction-btn {
                 width: 60px;
                 height: 60px;
                 font-size: 24px;
@@ -129,7 +129,7 @@ def index():
                 align-items: center;
                 justify-content: center;
             }
-            .arrow-btn:hover {
+            .direction-btn:hover {
                 background-color: #45a049;
             }
             .center-btn {
@@ -166,15 +166,26 @@ def index():
                 cursor: pointer;
                 margin: 20px auto;
                 display: block;
+                width: 200px;
             }
             .launch-btn:hover {
                 background-color: #E64A19;
+            }
+            .launch-btn:disabled {
+                background-color: #cccccc;
+                cursor: not-allowed;
             }
             .status {
                 text-align: center;
                 margin-top: 10px;
                 font-style: italic;
                 color: #666;
+                min-height: 20px;
+            }
+            .countdown {
+                font-size: 18px;
+                font-weight: bold;
+                color: #FF5722;
             }
         </style>
     </head>
@@ -187,19 +198,9 @@ def index():
             <div class="control-group">
                 <h2>Direction Control</h2>
                 <div class="control-row">
-                    <div></div>
-                    <button class="arrow-btn" onclick="moveServo('up')">↑</button>
-                    <div></div>
-                </div>
-                <div class="control-row">
-                    <button class="arrow-btn" onclick="moveServo('left')">←</button>
-                    <button class="arrow-btn center-btn" onclick="moveServo('center')">◎</button>
-                    <button class="arrow-btn" onclick="moveServo('right')">→</button>
-                </div>
-                <div class="control-row">
-                    <div></div>
-                    <button class="arrow-btn" onclick="moveServo('down')">↓</button>
-                    <div></div>
+                    <button class="direction-btn" onclick="moveDirection('left')">←</button>
+                    <button class="direction-btn center-btn" onclick="moveDirection('center')">◎</button>
+                    <button class="direction-btn" onclick="moveDirection('right')">→</button>
                 </div>
             </div>
             
@@ -211,7 +212,7 @@ def index():
                 </div>
             </div>
             
-            <button class="launch-btn" onclick="launchBall()">LAUNCH BALL</button>
+            <button id="launch-btn" class="launch-btn" onclick="launchBall()">LAUNCH BALL</button>
             <div class="status" id="status"></div>
         </div>
 
@@ -226,44 +227,69 @@ def index():
                     });
             }
             
-            // Move servo in specific direction
-            function moveServo(direction) {
+            // Move direction servo
+            function moveDirection(direction) {
                 fetch('/servo?direction=' + direction)
                     .then(response => response.text())
                     .then(data => {
                         console.log(data);
-                        document.getElementById('status').textContent = 'Moved: ' + direction;
+                        document.getElementById('status').textContent = 'Direction: ' + direction;
                     });
             }
             
             // Launch the ball
             function launchBall() {
-                document.getElementById('status').textContent = 'Launching ball...';
+                // Disable launch button
+                const launchBtn = document.getElementById('launch-btn');
+                launchBtn.disabled = true;
+                
+                const statusElement = document.getElementById('status');
+                statusElement.innerHTML = 'Launching: Motors starting...';
+                
                 fetch('/launch')
-                    .then(response => response.text())
+                    .then(response => response.json())
                     .then(data => {
                         console.log(data);
-                        document.getElementById('status').textContent = data;
+                        
+                        // Start countdown display
+                        let secondsLeft = 6; // Total launch sequence time
+                        
+                        const countdownInterval = setInterval(() => {
+                            secondsLeft -= 1;
+                            
+                            if (secondsLeft <= 3) {
+                                statusElement.innerHTML = `Launching: Ball released, motors stopping in ${secondsLeft} seconds...`;
+                            } else {
+                                statusElement.innerHTML = `Launching: Motors running, ball release in ${secondsLeft - 3} seconds...`;
+                            }
+                            
+                            if (secondsLeft <= 0) {
+                                clearInterval(countdownInterval);
+                                statusElement.textContent = 'Launch complete!';
+                                launchBtn.disabled = false;
+                            }
+                        }, 1000);
+                    })
+                    .catch(error => {
+                        console.error('Launch error:', error);
+                        statusElement.textContent = 'Launch failed! Please try again.';
+                        launchBtn.disabled = false;
                     });
             }
             
-            // Add keyboard support for arrow keys
+            // Add keyboard support
             document.addEventListener('keydown', function(event) {
                 switch(event.key) {
-                    case 'ArrowUp':
-                        moveServo('up');
-                        break;
-                    case 'ArrowDown':
-                        moveServo('down');
-                        break;
                     case 'ArrowLeft':
-                        moveServo('left');
+                        moveDirection('left');
                         break;
                     case 'ArrowRight':
-                        moveServo('right');
+                        moveDirection('right');
                         break;
                     case ' ':  // Spacebar
-                        launchBall();
+                        if (!document.getElementById('launch-btn').disabled) {
+                            launchBall();
+                        }
                         break;
                 }
             });
@@ -279,30 +305,24 @@ def video_feed():
 
 @app.route('/servo')
 def control_servo():
-    global servo_positions
+    global direction_position
     direction = request.args.get('direction', 'center')
     
     # Servo step size (microseconds)
     step = 100
     
-    # Update servo positions based on direction
+    # Update servo position based on direction
     if direction == 'left':
-        servo_positions['pan'] = max(500, servo_positions['pan'] - step)
+        direction_position = max(500, direction_position - step)
     elif direction == 'right':
-        servo_positions['pan'] = min(2500, servo_positions['pan'] + step)
-    elif direction == 'up':
-        servo_positions['tilt'] = max(500, servo_positions['tilt'] - step)
-    elif direction == 'down':
-        servo_positions['tilt'] = min(2500, servo_positions['tilt'] + step)
+        direction_position = min(2500, direction_position + step)
     elif direction == 'center':
-        servo_positions['pan'] = 1500
-        servo_positions['tilt'] = 1500
+        direction_position = 1500
     
-    # Apply the new servo positions
-    pi.set_servo_pulsewidth(SERVO_PAN_PIN, servo_positions['pan'])
-    pi.set_servo_pulsewidth(SERVO_TILT_PIN, servo_positions['tilt'])
+    # Apply the new servo position
+    pi.set_servo_pulsewidth(SERVO_DIRECTION_PIN, direction_position)
     
-    return f"Servo moved: {direction}, Pan: {servo_positions['pan']}, Tilt: {servo_positions['tilt']}"
+    return f"Direction servo moved: {direction}, Position: {direction_position}"
 
 @app.route('/motor')
 def control_motor():
@@ -313,54 +333,75 @@ def control_motor():
     power = max(0, min(100, power))
     motor_power = power
     
-    # Convert percentage to PWM value (0-255)
-    pwm_value = int(power * 255 / 100)
-    
-    # Apply PWM to motor
-    pi.set_PWM_dutycycle(MOTOR_PIN_1, pwm_value)
-    
-    # For bidirectional control, you might do something like:
-    # if power > 0:
-    #     pi.set_PWM_dutycycle(MOTOR_PIN_1, pwm_value)
-    #     pi.set_PWM_dutycycle(MOTOR_PIN_2, 0)
-    # else:
-    #     pi.set_PWM_dutycycle(MOTOR_PIN_1, 0)
-    #     pi.set_PWM_dutycycle(MOTOR_PIN_2, abs(pwm_value))
+    # If we're not in a launch sequence, update the motor power
+    if not is_launching:
+        # Convert percentage to PWM value (0-255)
+        pwm_value = int(power * 255 / 100)
+        
+        # Apply PWM to motors (both motors get the same power)
+        pi.set_PWM_dutycycle(MOTOR_PIN_1, pwm_value)
+        pi.set_PWM_dutycycle(MOTOR_PIN_2, pwm_value)
     
     return f"Motor power set to {power}%"
 
 @app.route('/launch')
 def launch_ball():
-    # This function could activate a servo to release a ball
-    # For this example, we'll simulate a ball release
+    global is_launching
+    
+    # Prevent multiple launches at once
+    if is_launching:
+        return jsonify({"status": "error", "message": "Launch already in progress"})
+    
+    # Get current power level
+    power = motor_power
+    
+    if power < 10:
+        return jsonify({"status": "error", "message": "Motor power too low"})
+    
+    # Start the launch sequence in a separate thread
+    threading.Thread(target=launch_sequence, args=(power,)).start()
+    
+    return jsonify({"status": "success", "message": "Launch sequence started"})
+
+def launch_sequence(power):
+    global is_launching
+    
     try:
-        # Get current power level
-        power = motor_power
-        
-        if power < 10:
-            return "Motor power too low. Increase power to launch."
-        
-        # Example: Use a servo to release a ball
-        # Assuming a third servo on pin 20 controls the ball release mechanism
-        RELEASE_SERVO_PIN = 20
-        
-        # Open the release mechanism
-        pi.set_servo_pulsewidth(RELEASE_SERVO_PIN, 2000)  # Position to release ball
-        time.sleep(0.5)  # Wait for ball to release
-        
-        # Close the release mechanism
-        pi.set_servo_pulsewidth(RELEASE_SERVO_PIN, 1000)  # Position to hold balls
-        
-        return f"Ball launched with power: {power}%"
-        
+        with launch_lock:
+            is_launching = True
+            
+            # Convert percentage to PWM value (0-255)
+            pwm_value = int(power * 255 / 100)
+            
+            # Step 1: Start motors
+            pi.set_PWM_dutycycle(MOTOR_PIN_1, pwm_value)
+            pi.set_PWM_dutycycle(MOTOR_PIN_2, pwm_value)
+            
+            # Step 2: Wait 3 seconds
+            time.sleep(3)
+            
+            # Step 3: Trigger ball release servo
+            pi.set_servo_pulsewidth(SERVO_RELEASE_PIN, 2000)  # Open position to release ball
+            time.sleep(0.5)  # Give the ball time to drop
+            pi.set_servo_pulsewidth(SERVO_RELEASE_PIN, 1000)  # Close position to hold remaining balls
+            
+            # Step 4: Wait 3 more seconds with motors still running
+            time.sleep(3)
+            
+            # Step 5: Stop motors
+            pi.set_PWM_dutycycle(MOTOR_PIN_1, 0)
+            pi.set_PWM_dutycycle(MOTOR_PIN_2, 0)
+            
     except Exception as e:
-        return f"Launch error: {str(e)}"
+        print(f"Launch sequence error: {str(e)}")
+    finally:
+        is_launching = False
 
 # Cleanup function to ensure all resources are properly released
 def cleanup():
     # Stop all servos
-    pi.set_servo_pulsewidth(SERVO_PAN_PIN, 0)
-    pi.set_servo_pulsewidth(SERVO_TILT_PIN, 0)
+    pi.set_servo_pulsewidth(SERVO_DIRECTION_PIN, 0)
+    pi.set_servo_pulsewidth(SERVO_RELEASE_PIN, 0)
     
     # Stop motors
     pi.set_PWM_dutycycle(MOTOR_PIN_1, 0)
